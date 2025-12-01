@@ -4,6 +4,12 @@ const Server = net.Server;
 const Connection = Server.Connection;
 const Allocator = std.mem.Allocator;
 
+const OpcodeValue = enum(u8) {
+    Message = 0x1,
+    Ping = 0x9,
+    Pong = 0xA,
+};
+
 pub const JolzzServer = struct {
     ip: []const u8,
     port: u16,
@@ -92,14 +98,17 @@ pub const JolzzServer = struct {
         upgradeConnection(websocket, header_data) catch
             @panic("An error occured while upgrading the connection");
 
-        websocketMessage(websocket, "hello js from zig!") catch {
+        websocketMessage(websocket, "hello js from zig!") catch
             std.debug.print("WebSocket write failed\n", .{});
-        };
 
         while (!shutdown_server.*) {
             var buffer: [4096]u8 = undefined;
-            websocketRead(websocket, &buffer) catch {
+            websocketRead(websocket, &buffer) catch
                 std.debug.print("WebSocket read failed\n", .{});
+
+            heartbeatTimer(websocket) catch |err| switch (err) {
+                error.HeartbeatFailed => @panic("Heartbeat failed"),
+                error.HeartbeatLost => break,
             };
         }
     }
@@ -153,14 +162,40 @@ pub const JolzzServer = struct {
         return encoder.encode(base64_result, &sha1_result);
     }
 
+    fn heartbeatTimer(websocket: *WebSocketInstance) error{ HeartbeatFailed, HeartbeatLost }!void {
+        if (websocket.lastReadTime < std.time.milliTimestamp() - 5 * std.time.ms_per_s) {
+            std.debug.print("Sent ping", .{});
+            websocketHeartbeatCheck(websocket) catch {
+                std.debug.print("Heartbeat ping failed. Closing connection\n", .{});
+                return error.HeartbeatFailed;
+            };
+
+            if (websocket.lastReadTime < std.time.milliTimestamp() - 10 * std.time.ms_per_s) {
+                websocketReadPong(websocket) catch {
+                    std.debug.print("Heartbeat pong failed. Closing connection\n", .{});
+                    return error.HeartbeatFailed;
+                };
+            } else return error.HeartbeatLost; // Automatically disconnect the connection
+        }
+    }
+
     fn websocketRead(websocket: *WebSocketInstance, buffer: []u8) !void {
         const message_length = try websocket.connection.stream.read(buffer);
+        if (message_length > 0) websocket.lastReadTime = std.time.milliTimestamp();
         var seek: usize = 0;
 
         while (seek < message_length) {
             const frame = parseFrame(&seek, buffer) orelse continue;
             std.debug.print("{s}\n", .{frame});
         }
+    }
+
+    fn websocketReadPong(websocket: *WebSocketInstance) !void {
+        var buffer: [2]u8 = undefined;
+        _ = try websocket.connection.stream.read(&buffer);
+        var seek: usize = 0;
+        if (parseFrame(&seek, &buffer) != null)
+            websocket.lastReadTime = std.time.milliTimestamp();
     }
 
     fn parseFrame(seek: *usize, buffer: []u8) ?[]const u8 {
@@ -177,7 +212,10 @@ pub const JolzzServer = struct {
             return null;
         }
 
-        if (opcode != 1) {
+        if (opcode == @intFromEnum(OpcodeValue.Pong)) {
+            std.debug.print("Detected heartbeat. Keep connection live\n", .{});
+            return &.{};
+        } else if (opcode != @intFromEnum(OpcodeValue.Message)) {
             std.debug.print("Only text is valid for messages\n", .{});
             return null;
         }
@@ -217,13 +255,19 @@ pub const JolzzServer = struct {
     fn websocketMessage(websocket: *WebSocketInstance, payload: []const u8) !void {
         var buffer: [4096]u8 = undefined;
         var seek: usize = 0;
-        createFrame(&seek, &buffer, payload);
+        createFrame(&seek, &buffer, payload, .Message);
         _ = try websocket.connection.stream.write(buffer[0..seek]);
     }
 
-    fn createFrame(seek: *usize, buffer: []u8, payload: []const u8) void {
+    fn websocketHeartbeatCheck(websocket: *WebSocketInstance) !void {
+        var buffer: [2]u8 = undefined;
+        var seek: usize = 0;
+        createFrame(&seek, &buffer, &.{}, .Ping);
+        _ = try websocket.connection.stream.write(buffer[0..seek]);
+    }
+
+    fn createFrame(seek: *usize, buffer: []u8, payload: []const u8, opcode: OpcodeValue) void {
         const fin: u8 = 0x80;
-        const opcode: u8 = 1;
         const payload_bits: u8 = payload_blk: {
             if (payload.len <= 125) {
                 break :payload_blk @intCast(payload.len);
@@ -234,7 +278,7 @@ pub const JolzzServer = struct {
             }
         };
 
-        buffer[seek.*] = fin + opcode;
+        buffer[seek.*] = fin + @intFromEnum(opcode);
         seek.* += 1;
 
         buffer[seek.*] = payload_bits;
@@ -289,6 +333,7 @@ const WebSocketInstance = struct {
     allocator: Allocator,
     connection: Connection,
     server: *std.http.Server,
+    lastReadTime: i64,
 
     pub fn init(allocator: Allocator, connection: Connection) !WebSocketInstance {
         const reader_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
@@ -303,6 +348,7 @@ const WebSocketInstance = struct {
             .allocator = allocator,
             .connection = connection,
             .server = &server,
+            .lastReadTime = std.time.milliTimestamp(),
         };
     }
 
