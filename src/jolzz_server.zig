@@ -3,6 +3,7 @@ const net = std.net;
 const Server = net.Server;
 const Connection = Server.Connection;
 const Allocator = std.mem.Allocator;
+const Game = @import("game.zig").Game;
 
 const OpcodeValue = enum(u8) {
     Message = 0x1,
@@ -44,14 +45,14 @@ pub const JolzzServer = struct {
         for (self.connections.items) |connection|
             connection.join();
 
-        for (self.websocket_instances.items) |websocket|
+        for (self.websocket_instances.items) |*websocket|
             websocket.deinit();
 
         self.connections.deinit(self.allocator);
         self.websocket_instances.deinit(self.allocator);
     }
 
-    pub fn connectionListener(self: *Self) void {
+    pub fn connectionListener(self: *Self, games: *std.array_list.Aligned(Game, null)) void {
         while (getConnection(&self.server)) |connection| {
             std.debug.print("Found listener\n", .{});
 
@@ -59,10 +60,19 @@ pub const JolzzServer = struct {
                 @panic("Could not create WebSocketInstance");
             errdefer websocket.deinit();
 
+            if (games.items.len == 0)
+                games.append(self.allocator, Game.init()) catch @panic("OOM");
+
+            var game = games.getLast();
+            if (game.isFull()) {
+                game = Game.init();
+                games.append(self.allocator, game) catch @panic("OOM");
+            }
+
             const thread = std.Thread.spawn(
                 .{ .allocator = self.allocator },
                 runSocket,
-                .{ &websocket, &self.shutdown_server },
+                .{ &websocket, &self.shutdown_server, &game },
             ) catch |err| {
                 std.debug.print("Could not make thread: {any}", .{err});
                 return;
@@ -73,7 +83,7 @@ pub const JolzzServer = struct {
         }
     }
 
-    fn runSocket(websocket: *WebSocketInstance, shutdown_server: *bool) void {
+    fn runSocket(websocket: *WebSocketInstance, shutdown_server: *bool, game: *Game) void {
         var receive_buffer: [4096]u8 = undefined;
         var header_offset: usize = 0;
 
@@ -98,15 +108,19 @@ pub const JolzzServer = struct {
         upgradeConnection(websocket, header_data) catch
             @panic("An error occured while upgrading the connection");
 
-        websocketMessage(websocket, "hello js from zig!") catch
+        websocket.websocketMessage("hello js from zig!") catch
             std.debug.print("WebSocket write failed\n", .{});
 
         while (!shutdown_server.*) {
             var buffer: [4096]u8 = undefined;
-            websocketRead(websocket, &buffer) catch
+            const message = websocket.websocketRead(&buffer) catch blk: {
                 std.debug.print("WebSocket read failed\n", .{});
+                break :blk null;
+            };
 
-            heartbeatTimer(websocket) catch |err| switch (err) {
+            if (message) |m| game.getGameMessage(m);
+
+            websocket.heartbeatTimer() catch |err| switch (err) {
                 error.HeartbeatFailed => @panic("Heartbeat failed"),
                 error.HeartbeatLost => break,
             };
@@ -162,40 +176,67 @@ pub const JolzzServer = struct {
         return encoder.encode(base64_result, &sha1_result);
     }
 
-    fn heartbeatTimer(websocket: *WebSocketInstance) error{ HeartbeatFailed, HeartbeatLost }!void {
-        if (websocket.lastReadTime < std.time.milliTimestamp() - 5 * std.time.ms_per_s) {
-            std.debug.print("Sent ping", .{});
-            websocketHeartbeatCheck(websocket) catch {
-                std.debug.print("Heartbeat ping failed. Closing connection\n", .{});
-                return error.HeartbeatFailed;
-            };
-
-            if (websocket.lastReadTime < std.time.milliTimestamp() - 10 * std.time.ms_per_s) {
-                websocketReadPong(websocket) catch {
-                    std.debug.print("Heartbeat pong failed. Closing connection\n", .{});
-                    return error.HeartbeatFailed;
-                };
-            } else return error.HeartbeatLost; // Automatically disconnect the connection
-        }
+    inline fn getSwitchingProtocolsResponse() []const u8 {
+        return "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "\r\n";
     }
 
-    fn websocketRead(websocket: *WebSocketInstance, buffer: []u8) !void {
+    fn getConnection(server: *Server) ?Connection {
+        return server.accept() catch {
+            std.debug.print("Server did not accept the response\n", .{});
+            return null;
+        };
+    }
+
+    fn readFromConnection(websocket: *WebSocketInstance, buffer: []u8) ?usize {
+        const length = websocket.connection.stream.read(buffer) catch return null;
+        return if (length > 0) length else null;
+    }
+};
+
+pub const WebSocketInstance = struct {
+    allocator: Allocator,
+    connection: Connection,
+    server: *std.http.Server,
+    lastReadTime: i64,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, connection: Connection) !WebSocketInstance {
+        const reader_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
+        var stream_reader = connection.stream.reader(reader_buffer);
+
+        const writer_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
+        var stream_writer = connection.stream.writer(writer_buffer);
+
+        var server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
+
+        return .{
+            .allocator = allocator,
+            .connection = connection,
+            .server = &server,
+            .lastReadTime = std.time.milliTimestamp(),
+        };
+    }
+
+    pub fn deinit(websocket: *Self) void {
+        websocket.connection.stream.close();
+    }
+
+    pub fn websocketRead(websocket: *Self, buffer: []u8) !?[]const u8 {
         const message_length = try websocket.connection.stream.read(buffer);
         if (message_length > 0) websocket.lastReadTime = std.time.milliTimestamp();
         var seek: usize = 0;
 
-        while (seek < message_length) {
-            const frame = parseFrame(&seek, buffer) orelse continue;
+        if (parseFrame(&seek, buffer)) |frame| {
             std.debug.print("{s}\n", .{frame});
+            return frame;
         }
-    }
 
-    fn websocketReadPong(websocket: *WebSocketInstance) !void {
-        var buffer: [2]u8 = undefined;
-        _ = try websocket.connection.stream.read(&buffer);
-        var seek: usize = 0;
-        if (parseFrame(&seek, &buffer) != null)
-            websocket.lastReadTime = std.time.milliTimestamp();
+        return null;
     }
 
     fn parseFrame(seek: *usize, buffer: []u8) ?[]const u8 {
@@ -252,18 +293,26 @@ pub const JolzzServer = struct {
         return frame;
     }
 
-    fn websocketMessage(websocket: *WebSocketInstance, payload: []const u8) !void {
+    pub fn websocketMessage(websocket: *Self, payload: []const u8) !void {
         var buffer: [4096]u8 = undefined;
         var seek: usize = 0;
         createFrame(&seek, &buffer, payload, .Message);
         _ = try websocket.connection.stream.write(buffer[0..seek]);
     }
 
-    fn websocketHeartbeatCheck(websocket: *WebSocketInstance) !void {
+    fn websocketHeartbeatCheck(websocket: *Self) !void {
         var buffer: [2]u8 = undefined;
         var seek: usize = 0;
         createFrame(&seek, &buffer, &.{}, .Ping);
         _ = try websocket.connection.stream.write(buffer[0..seek]);
+    }
+
+    fn websocketReadPong(websocket: *Self) !void {
+        var buffer: [2]u8 = undefined;
+        _ = try websocket.connection.stream.read(&buffer);
+        var seek: usize = 0;
+        if (parseFrame(&seek, &buffer) != null)
+            websocket.lastReadTime = std.time.milliTimestamp();
     }
 
     fn createFrame(seek: *usize, buffer: []u8, payload: []const u8, opcode: OpcodeValue) void {
@@ -308,51 +357,20 @@ pub const JolzzServer = struct {
         seek.* += payload.len;
     }
 
-    inline fn getSwitchingProtocolsResponse() []const u8 {
-        return "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Accept: {s}\r\n" ++
-            "\r\n";
-    }
+    fn heartbeatTimer(websocket: *Self) error{ HeartbeatFailed, HeartbeatLost }!void {
+        if (websocket.lastReadTime < std.time.milliTimestamp() - 5 * std.time.ms_per_s) {
+            std.debug.print("Sent ping", .{});
+            websocketHeartbeatCheck(websocket) catch {
+                std.debug.print("Heartbeat ping failed. Closing connection\n", .{});
+                return error.HeartbeatFailed;
+            };
 
-    fn getConnection(server: *Server) ?Connection {
-        return server.accept() catch {
-            std.debug.print("Server did not accept the response\n", .{});
-            return null;
-        };
-    }
-
-    fn readFromConnection(websocket: *WebSocketInstance, buffer: []u8) ?usize {
-        const length = websocket.connection.stream.read(buffer) catch return null;
-        return if (length > 0) length else null;
-    }
-};
-
-const WebSocketInstance = struct {
-    allocator: Allocator,
-    connection: Connection,
-    server: *std.http.Server,
-    lastReadTime: i64,
-
-    pub fn init(allocator: Allocator, connection: Connection) !WebSocketInstance {
-        const reader_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
-        var stream_reader = connection.stream.reader(reader_buffer);
-
-        const writer_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
-        var stream_writer = connection.stream.writer(writer_buffer);
-
-        var server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
-
-        return .{
-            .allocator = allocator,
-            .connection = connection,
-            .server = &server,
-            .lastReadTime = std.time.milliTimestamp(),
-        };
-    }
-
-    pub fn deinit(websocket: WebSocketInstance) void {
-        websocket.connection.stream.close();
+            if (websocket.lastReadTime < std.time.milliTimestamp() - 10 * std.time.ms_per_s) {
+                websocketReadPong(websocket) catch {
+                    std.debug.print("Heartbeat pong failed. Closing connection\n", .{});
+                    return error.HeartbeatFailed;
+                };
+            } else return error.HeartbeatLost; // Automatically disconnect the connection
+        }
     }
 };
