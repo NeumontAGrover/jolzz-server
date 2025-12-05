@@ -10,11 +10,14 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer if (gpa.deinit() == .leak) @panic("Memory leaks detected");
 
-    var current_games = try std.ArrayList(Game).initCapacity(allocator, 8);
-    defer current_games.deinit(allocator);
+    var current_games = try std.ArrayList(*Game).initCapacity(allocator, 8);
+    defer {
+        for (current_games.items) |game| game.deinit();
+        current_games.deinit(allocator);
+    }
 
     var jolzz_server = try JolzzServer.init(allocator, server_ip, server_port);
     defer jolzz_server.deinit();
 
-    jolzz_server.connectionListener(&current_games);
+    jolzz_server.connectionListener(&current_games) catch @panic("OOM");
 }

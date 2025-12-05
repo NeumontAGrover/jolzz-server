@@ -4,6 +4,7 @@ const Server = net.Server;
 const Connection = Server.Connection;
 const Allocator = std.mem.Allocator;
 const Game = @import("game.zig").Game;
+const Player = @import("player.zig").Player;
 
 const OpcodeValue = enum(u8) {
     Message = 0x1,
@@ -17,7 +18,6 @@ pub const JolzzServer = struct {
     server: Server,
     allocator: Allocator,
     connections: std.array_list.Aligned(std.Thread, null),
-    websocket_instances: std.array_list.Aligned(WebSocketInstance, null),
     shutdown_server: bool = false,
 
     const Self = @This();
@@ -34,7 +34,6 @@ pub const JolzzServer = struct {
             .server = listener,
             .allocator = allocator,
             .connections = try std.ArrayList(std.Thread).initCapacity(allocator, 8),
-            .websocket_instances = try std.ArrayList(WebSocketInstance).initCapacity(allocator, 8),
         };
     }
 
@@ -45,49 +44,49 @@ pub const JolzzServer = struct {
         for (self.connections.items) |connection|
             connection.join();
 
-        for (self.websocket_instances.items) |*websocket|
-            websocket.deinit();
-
         self.connections.deinit(self.allocator);
-        self.websocket_instances.deinit(self.allocator);
     }
 
-    pub fn connectionListener(self: *Self, games: *std.array_list.Aligned(Game, null)) void {
+    pub fn connectionListener(self: *Self, games: *std.array_list.Aligned(*Game, null)) !void {
         while (getConnection(&self.server)) |connection| {
-            std.debug.print("Found listener\n", .{});
+            std.debug.print("\x1b[3m\nFound listener\n\x1b[0m", .{});
 
             var websocket = WebSocketInstance.init(self.allocator, connection) catch
                 @panic("Could not create WebSocketInstance");
             errdefer websocket.deinit();
 
             if (games.items.len == 0)
-                games.append(self.allocator, Game.init()) catch @panic("OOM");
+                try games.append(self.allocator, try Game.init(self.allocator));
 
-            var game = games.getLast();
+            var game = games.items[games.items.len - 1];
+            std.debug.print("\x1b[32m\nGame: {}\n\x1b[0m", .{games.items.len - 1});
+
+            const player = try Player.init(self.allocator, websocket);
+            try game.addPlayer(player); // Gives the player their color
+
             if (game.isFull()) {
-                game = Game.init();
-                games.append(self.allocator, game) catch @panic("OOM");
+                const new_game = try Game.init(self.allocator);
+                try games.append(self.allocator, new_game);
             }
 
             const thread = std.Thread.spawn(
                 .{ .allocator = self.allocator },
                 runSocket,
-                .{ &websocket, &self.shutdown_server, &game },
+                .{ player, &self.shutdown_server, game },
             ) catch |err| {
                 std.debug.print("Could not make thread: {any}", .{err});
                 return;
             };
 
-            self.connections.append(self.allocator, thread) catch @panic("OOM");
-            self.websocket_instances.append(self.allocator, websocket) catch @panic("OOM");
+            try self.connections.append(self.allocator, thread);
         }
     }
 
-    fn runSocket(websocket: *WebSocketInstance, shutdown_server: *bool, game: *Game) void {
+    fn runSocket(player: *Player, shutdown_server: *bool, game: *Game) void {
         var receive_buffer: [4096]u8 = undefined;
         var header_offset: usize = 0;
 
-        while (readFromConnection(websocket, receive_buffer[header_offset..])) |receive_length| {
+        while (readFromConnection(player.websocket, receive_buffer[header_offset..])) |receive_length| {
             header_offset += receive_length;
             const header_termination = std.mem.containsAtLeast(
                 u8,
@@ -99,31 +98,30 @@ pub const JolzzServer = struct {
         }
 
         const header_data = receive_buffer[0..header_offset];
-        std.debug.print("{s}\n", .{header_data});
         if (header_data.len == 0) {
             std.debug.print("Connection successful but no data\n", .{});
             return;
         }
 
-        upgradeConnection(websocket, header_data) catch
+        upgradeConnection(player.websocket, header_data) catch
             @panic("An error occured while upgrading the connection");
 
-        websocket.websocketMessage("hello js from zig!") catch
-            std.debug.print("WebSocket write failed\n", .{});
+        // player.websocket.websocketMessage("hello js from zig!") catch
+        //     std.debug.print("WebSocket write failed\n", .{});
 
         while (!shutdown_server.*) {
             var buffer: [4096]u8 = undefined;
-            const message = websocket.websocketRead(&buffer) catch blk: {
+            const message = player.websocket.websocketRead(&buffer) catch blk: {
                 std.debug.print("WebSocket read failed\n", .{});
                 break :blk null;
             };
 
-            if (message) |m| game.getGameMessage(m);
+            if (message) |m| game.getGameMessage(player, m);
 
-            websocket.heartbeatTimer() catch |err| switch (err) {
-                error.HeartbeatFailed => @panic("Heartbeat failed"),
-                error.HeartbeatLost => break,
-            };
+            // player.websocket.heartbeatTimer() catch |err| switch (err) {
+            //     error.HeartbeatFailed => @panic("Heartbeat failed"),
+            //     error.HeartbeatLost => break,
+            // };
         }
     }
 
@@ -201,11 +199,13 @@ pub const WebSocketInstance = struct {
     allocator: Allocator,
     connection: Connection,
     server: *std.http.Server,
+    reader_buffer: []u8,
+    writer_buffer: []u8,
     lastReadTime: i64,
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, connection: Connection) !WebSocketInstance {
+    pub fn init(allocator: Allocator, connection: Connection) !*WebSocketInstance {
         const reader_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
         var stream_reader = connection.stream.reader(reader_buffer);
 
@@ -214,15 +214,19 @@ pub const WebSocketInstance = struct {
 
         var server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
 
-        return .{
-            .allocator = allocator,
-            .connection = connection,
-            .server = &server,
-            .lastReadTime = std.time.milliTimestamp(),
-        };
+        var websocket = try allocator.create(Self);
+        websocket.allocator = allocator;
+        websocket.connection = connection;
+        websocket.server = &server;
+        websocket.reader_buffer = reader_buffer;
+        websocket.writer_buffer = writer_buffer;
+        websocket.lastReadTime = std.time.milliTimestamp();
+        return websocket;
     }
 
     pub fn deinit(websocket: *Self) void {
+        websocket.allocator.free(websocket.reader_buffer);
+        websocket.allocator.free(websocket.writer_buffer);
         websocket.connection.stream.close();
     }
 
