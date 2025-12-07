@@ -6,10 +6,16 @@ const Allocator = std.mem.Allocator;
 const Game = @import("game.zig").Game;
 const Player = @import("player.zig").Player;
 
-const OpcodeValue = enum(u8) {
+const Opcode = enum(u8) {
     Message = 0x1,
     Ping = 0x9,
     Pong = 0xA,
+};
+
+const WebSocketReadError = error{
+    CannotFragment,
+    InvalidFormat,
+    Heartbeat,
 };
 
 pub const JolzzServer = struct {
@@ -110,13 +116,16 @@ pub const JolzzServer = struct {
         //     std.debug.print("WebSocket write failed\n", .{});
 
         while (!shutdown_server.*) {
-            var buffer: [4096]u8 = undefined;
-            const message = player.websocket.websocketRead(&buffer) catch blk: {
-                std.debug.print("WebSocket read failed\n", .{});
-                break :blk null;
+            var buffer: [4096]u8 = std.mem.zeroes([4096]u8);
+            const message: ?[]const u8 = player.websocket.websocketRead(&buffer) catch |err| {
+                std.debug.print("WebSocket read failed ({any})\n", .{err});
+                std.debug.print("Disconnecting {any} ({s})\n", .{ player.color, player.username.? });
+                game.removePlayer(player.color);
+                break;
             };
 
             if (message) |m| game.getGameMessage(player, m);
+            if (game.isReady()) game.sendGameIsReady();
 
             // player.websocket.heartbeatTimer() catch |err| switch (err) {
             //     error.HeartbeatFailed => @panic("Heartbeat failed"),
@@ -133,16 +142,18 @@ pub const JolzzServer = struct {
         var sec_client_key: [24]u8 = undefined;
         var iterator = std.mem.splitAny(u8, header_data, "\r\n");
         while (iterator.next()) |header| {
+            var lower_buffer: [256]u8 = undefined;
+            const lower_header = std.ascii.lowerString(&lower_buffer, header);
             if (!connection_upgrade)
-                connection_upgrade = std.mem.containsAtLeast(u8, header, 1, "Connection: Upgrade");
+                connection_upgrade = std.mem.containsAtLeast(u8, lower_header, 1, "connection: upgrade");
 
             if (!websocket_upgrade)
-                websocket_upgrade = std.mem.containsAtLeast(u8, header, 1, "Upgrade: websocket");
+                websocket_upgrade = std.mem.containsAtLeast(u8, lower_header, 1, "upgrade: websocket");
 
             if (!websocket_version)
-                websocket_version = std.mem.containsAtLeast(u8, header, 1, "Sec-WebSocket-Version: 13");
+                websocket_version = std.mem.containsAtLeast(u8, lower_header, 1, "sec-websocket-version: 13");
 
-            if (!obtained_client_key and std.mem.containsAtLeast(u8, header, 1, "Sec-WebSocket-Key")) {
+            if (!obtained_client_key and std.mem.containsAtLeast(u8, lower_header, 1, "sec-websocket-key")) {
                 const split_index = std.mem.lastIndexOf(u8, header, ":").? + 2;
                 @memcpy(&sec_client_key, header[split_index..]);
                 obtained_client_key = true;
@@ -230,20 +241,17 @@ pub const WebSocketInstance = struct {
         websocket.connection.stream.close();
     }
 
-    pub fn websocketRead(websocket: *Self, buffer: []u8) !?[]const u8 {
+    pub fn websocketRead(websocket: *Self, buffer: []u8) ![]const u8 {
         const message_length = try websocket.connection.stream.read(buffer);
         if (message_length > 0) websocket.lastReadTime = std.time.milliTimestamp();
         var seek: usize = 0;
 
-        if (parseFrame(&seek, buffer)) |frame| {
-            std.debug.print("{s}\n", .{frame});
-            return frame;
-        }
-
-        return null;
+        const frame = try parseFrame(&seek, buffer);
+        std.debug.print("{s}\n", .{frame});
+        return frame;
     }
 
-    fn parseFrame(seek: *usize, buffer: []u8) ?[]const u8 {
+    fn parseFrame(seek: *usize, buffer: []u8) WebSocketReadError![]const u8 {
         const fin = (buffer[seek.*] & 0x80) != 0;
         const opcode = buffer[seek.*] & 0x0F;
         seek.* += 1;
@@ -252,17 +260,12 @@ pub const WebSocketInstance = struct {
         var payload_len: usize = buffer[seek.*] & 0x7F;
         seek.* += 1;
 
-        if (!fin) {
-            std.debug.print("Fragmenting messages not supported\n", .{});
-            return null;
-        }
+        if (!fin or opcode == 0) return error.CannotFragment;
 
-        if (opcode == @intFromEnum(OpcodeValue.Pong)) {
-            std.debug.print("Detected heartbeat. Keep connection live\n", .{});
-            return &.{};
-        } else if (opcode != @intFromEnum(OpcodeValue.Message)) {
-            std.debug.print("Only text is valid for messages\n", .{});
-            return null;
+        if (opcode == @intFromEnum(Opcode.Pong)) {
+            return error.Heartbeat;
+        } else if (opcode != @intFromEnum(Opcode.Message)) {
+            return error.InvalidFormat;
         }
 
         if (payload_len == 126) {
@@ -315,11 +318,11 @@ pub const WebSocketInstance = struct {
         var buffer: [2]u8 = undefined;
         _ = try websocket.connection.stream.read(&buffer);
         var seek: usize = 0;
-        if (parseFrame(&seek, &buffer) != null)
-            websocket.lastReadTime = std.time.milliTimestamp();
+        _ = try parseFrame(&seek, &buffer);
+        websocket.lastReadTime = std.time.milliTimestamp();
     }
 
-    fn createFrame(seek: *usize, buffer: []u8, payload: []const u8, opcode: OpcodeValue) void {
+    fn createFrame(seek: *usize, buffer: []u8, payload: []const u8, opcode: Opcode) void {
         const fin: u8 = 0x80;
         const payload_bits: u8 = payload_blk: {
             if (payload.len <= 125) {
@@ -331,7 +334,7 @@ pub const WebSocketInstance = struct {
             }
         };
 
-        buffer[seek.*] = fin + @intFromEnum(opcode);
+        buffer[seek.*] = fin | @intFromEnum(opcode);
         seek.* += 1;
 
         buffer[seek.*] = payload_bits;
