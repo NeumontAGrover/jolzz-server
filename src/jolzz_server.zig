@@ -112,16 +112,20 @@ pub const JolzzServer = struct {
         upgradeConnection(player.websocket, header_data) catch
             @panic("An error occured while upgrading the connection");
 
-        // player.websocket.websocketMessage("hello js from zig!") catch
-        //     std.debug.print("WebSocket write failed\n", .{});
-
         while (!shutdown_server.*) {
             var buffer: [4096]u8 = std.mem.zeroes([4096]u8);
-            const message: ?[]const u8 = player.websocket.websocketRead(&buffer) catch |err| {
+            const message: ?[]const u8 = player.websocket.websocketRead(&buffer) catch |err| blk: {
+                defer game.removePlayer(player.color);
+
+                if (err == error.NotOpenForReading) {
+                    std.debug.print("Client dropped\n", .{});
+                    break :blk null;
+                }
+
                 std.debug.print("WebSocket read failed ({any})\n", .{err});
-                std.debug.print("Disconnecting {any} ({s})\n", .{ player.color, player.username.? });
-                game.removePlayer(player.color);
-                break;
+                std.debug.print("Disconnecting {any} ({?s})\n", .{ player.color, player.username });
+
+                break :blk null;
             };
 
             if (message) |m| game.getGameMessage(player, m);

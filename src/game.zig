@@ -11,15 +11,13 @@ const GameAction = enum {
     Invalid,
 };
 
-const Piece = *const [2:0]u8;
-
 pub const Game = struct {
     allocator: std.mem.Allocator,
     turn: PlayerColor,
     white_player: ?*Player,
     black_player: ?*Player,
     started: bool,
-    board: [64]Piece = undefined,
+    board: [64]u8 = undefined,
 
     const Self = @This();
 
@@ -51,7 +49,14 @@ pub const Game = struct {
 
                 if (self.canPlayerMove(player, .White)) {
                     sendMessageToPlayer(player, "valid_move=true");
-                    sendMessageToPlayer(self.black_player.?, message[3..]);
+
+                    const move_message = std.mem.concat(
+                        self.allocator,
+                        u8,
+                        &.{ "new_board=", message[3..] },
+                    ) catch @panic("OOM");
+                    defer self.allocator.free(move_message);
+                    sendMessageToPlayer(self.black_player.?, move_message);
                 } else sendMessageToPlayer(player, "valid_move=false");
             },
             .BlackMove => {
@@ -62,7 +67,14 @@ pub const Game = struct {
 
                 if (self.canPlayerMove(player, .Black)) {
                     sendMessageToPlayer(player, "valid_move=true");
-                    sendMessageToPlayer(self.white_player.?, message[3..]);
+
+                    const move_message = std.mem.concat(
+                        self.allocator,
+                        u8,
+                        &.{ "new_board=", message[3..] },
+                    ) catch @panic("OOM");
+                    defer self.allocator.free(move_message);
+                    sendMessageToPlayer(self.white_player.?, move_message);
                 } else sendMessageToPlayer(player, "valid_move=false");
             },
             .WhiteWin => {},
@@ -156,23 +168,23 @@ pub const Game = struct {
         std.debug.print("\x1b[34m{s} (white)\n", .{self.white_player.?.username.?});
         std.debug.print("{s} (black)\x1b[0m\n", .{self.black_player.?.username.?});
 
-        const game_ready_message_white = std.mem.concat(
+        const game_ready_message_white = std.fmt.allocPrint(
             self.allocator,
-            u8,
-            &.{ "game_ready=true,", self.black_player.?.username.? },
+            "{s},{s},{s}",
+            .{ "game_ready=true", self.black_player.?.username.?, "black" },
         ) catch @panic("OOM");
         defer self.allocator.free(game_ready_message_white);
         sendMessageToPlayer(self.white_player.?, game_ready_message_white);
-        // sendMessageToPlayer(self.white_player.?, self.boardString());
+        sendMessageToPlayer(self.white_player.?, "new_board=" ++ self.board);
 
-        const game_ready_message_black = std.mem.concat(
+        const game_ready_message_black = std.fmt.allocPrint(
             self.allocator,
-            u8,
-            &.{ "game_ready=true,", self.white_player.?.username.? },
+            "{s},{s},{s}",
+            .{ "game_ready=true", self.white_player.?.username.?, "white" },
         ) catch @panic("OOM");
         defer self.allocator.free(game_ready_message_black);
         sendMessageToPlayer(self.black_player.?, game_ready_message_black);
-        // sendMessageToPlayer(self.black_player.?, self.boardString());
+        sendMessageToPlayer(self.black_player.?, "new_board=" ++ self.board);
 
         self.started = true;
     }
@@ -184,21 +196,21 @@ pub const Game = struct {
 
         const white_rows = [_]u8{ 0, 16 };
         const black_rows = [_]u8{ 48, 64 };
-        var created_pieces: [16]Piece = undefined;
+        var created_pieces: [16]u8 = undefined;
 
         const king_placement = random.intRangeAtMost(u3, 0, 7);
-        self.board[king_placement] = "wk";
-        created_pieces[king_placement] = "wk";
+        self.board[king_placement] = 'K';
+        created_pieces[king_placement] = 'K';
 
         for (white_rows[0]..white_rows[1]) |i| {
             if (king_placement == i) continue;
 
             switch (random.intRangeAtMost(u3, 0, 4)) {
-                0 => self.board[i] = "wp",
-                1 => self.board[i] = "wb",
-                2 => self.board[i] = "wn",
-                3 => self.board[i] = "wr",
-                4 => self.board[i] = "wq",
+                0 => self.board[i] = 'P',
+                1 => self.board[i] = 'B',
+                2 => self.board[i] = 'N',
+                3 => self.board[i] = 'R',
+                4 => self.board[i] = 'Q',
                 else => @panic("Invalid piece"),
             }
 
@@ -209,30 +221,19 @@ pub const Game = struct {
             const loop_index = i - black_rows[0];
             const row = loop_index / 8;
             self.board[i] = created_pieces[(loop_index % 8) + (1 - row) * 8];
-            self.board[i] = switch (self.board[i][1]) {
-                'p' => "bp",
-                'b' => "bb",
-                'n' => "bn",
-                'r' => "br",
-                'q' => "bq",
-                'k' => "bk",
+            self.board[i] = switch (self.board[i]) {
+                'P' => 'p',
+                'B' => 'b',
+                'N' => 'n',
+                'R' => 'r',
+                'Q' => 'q',
+                'K' => 'k',
                 else => @panic("Invalid Piece"),
             };
         }
 
         for (white_rows[1]..black_rows[0]) |i|
-            self.board[i] = "__";
-    }
-
-    fn boardString(self: *Self) []const u8 {
-        var board_string: [self.board.len * 2]u8 = undefined;
-        for (0..self.board.len) |i| {
-            const piece = self.board[i];
-            board_string[i * 2] = piece[0];
-            board_string[i * 2 + 1] = piece[1];
-        }
-
-        return &board_string;
+            self.board[i] = '_';
     }
 
     pub fn isReady(self: *const Self) bool {
@@ -255,7 +256,7 @@ pub const Game = struct {
 };
 
 test "Create Chess Board" {
-    var board: [64]Piece = undefined;
+    var board: [64]u8 = undefined;
 
     const seed: u64 = @intCast(std.time.milliTimestamp());
     var xoshiro256 = std.Random.DefaultPrng.init(seed);
@@ -263,21 +264,21 @@ test "Create Chess Board" {
 
     const white_rows = [_]u8{ 0, 16 };
     const black_rows = [_]u8{ 48, 64 };
-    var created_pieces: [16]Piece = undefined;
+    var created_pieces: [16]u8 = undefined;
 
     const king_placement = random.intRangeAtMost(u3, 0, 7);
-    board[king_placement] = "wk";
-    created_pieces[king_placement] = "wk";
+    board[king_placement] = 'K';
+    created_pieces[king_placement] = 'K';
 
     for (white_rows[0]..white_rows[1]) |i| {
         if (king_placement == i) continue;
 
         switch (random.intRangeAtMost(u3, 0, 4)) {
-            0 => board[i] = "wp",
-            1 => board[i] = "wb",
-            2 => board[i] = "wn",
-            3 => board[i] = "wr",
-            4 => board[i] = "wq",
+            0 => board[i] = 'P',
+            1 => board[i] = 'B',
+            2 => board[i] = 'N',
+            3 => board[i] = 'R',
+            4 => board[i] = 'Q',
             else => @panic("Invalid piece"),
         }
 
@@ -288,31 +289,23 @@ test "Create Chess Board" {
         const loop_index = i - black_rows[0];
         const row = loop_index / 8;
         board[i] = created_pieces[(loop_index % 8) + (1 - row) * 8];
-        board[i] = switch (board[i][1]) {
-            'p' => "bp",
-            'b' => "bb",
-            'n' => "bn",
-            'r' => "br",
-            'q' => "bq",
-            'k' => "bk",
+        board[i] = switch (board[i]) {
+            'P' => 'p',
+            'B' => 'b',
+            'N' => 'n',
+            'R' => 'r',
+            'Q' => 'q',
+            'K' => 'k',
             else => @panic("Invalid Piece"),
         };
     }
 
     for (white_rows[1]..black_rows[0]) |i|
-        board[i] = "__";
+        board[i] = '_';
 
     for (board, 0..) |piece, i| {
         if (i % 8 == 0) std.debug.print("\n", .{});
-        std.debug.print(" {s} ", .{piece});
+        std.debug.print(" {c} ", .{piece});
     }
     std.debug.print("\n", .{});
-
-    var board_string: [board.len * 2]u8 = undefined;
-    for (0..board.len) |i| {
-        const piece = board[i];
-        board_string[i * 2] = piece[0];
-        board_string[i * 2 + 1] = piece[1];
-    }
-    std.debug.print("{s}\n", .{board_string});
 }

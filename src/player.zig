@@ -23,7 +23,8 @@ pub const Player = struct {
 
     pub fn deinit(self: *Self) void {
         self.websocket.deinit();
-        self.allocator.free(self.username.?);
+        if (self.username) |username|
+            self.allocator.free(username);
         self.allocator.destroy(self);
     }
 
